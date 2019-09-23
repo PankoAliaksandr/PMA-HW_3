@@ -1,0 +1,357 @@
+\documentclass{article}
+
+\title{\vspace{-3cm}PM:Applications HW 3}
+\author{Ilia Kurennoi, Aliaksandr Panko}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage[a4paper,margin=2cm, tmargin=3cm]{geometry}
+\usepackage{graphicx}
+
+\begin{document}
+\SweaveOpts{concordance=TRUE}
+
+\maketitle
+
+<<echo=FALSE, results=hide>>=
+library(lubridate)
+library(PerformanceAnalytics)
+library(xts)
+library(quantmod)
+
+data_load <- function(){
+  
+   # load FOMC-dates
+  cat("\nChoose Rdata file\n")
+  load(file.choose(), envir = parent.frame())
+ 
+   # load Fama-French factors
+  cat("\nChoose .csv file\n")
+  FF_factors <- read.csv2(file.choose(), sep="," ,dec=".")
+  FF_factors$Date <- as.Date(as.character(FF_factors$Date), format="%Y%m%d")
+  
+  # Take Date and returns
+  MktRF <- FF_factors[c("Date","Mkt.RF")]
+  MktRF <- as.xts(MktRF, order.by = MktRF$Date)
+  MktRF <- MktRF$Mkt.RF
+  
+  
+  rassel2000 <- getSymbols("^RUT", src="yahoo", auto.assign = FALSE)
+  rassel2000 <- Return.calculate(rassel2000$RUT.Adjusted)
+  
+  commodity_index <- getSymbols("DJP", src="yahoo", auto.assign = FALSE)
+  commodity_index <- Return.calculate(commodity_index$DJP.Adjusted)
+  
+  EURUSD <- getSymbols("EURUSD=X", src="yahoo", auto.assign = FALSE)
+  EURUSD <- Return.calculate(EURUSD$`EURUSD=X.Adjusted`)
+  
+  return_list <- list(MktRF = MktRF,
+                      rassel =  rassel2000,
+                      cmdt = commodity_index,
+                      EURUSD = EURUSD)
+  
+  return(return_list)
+}
+determine_dates <- function(index_data, n_days, index_type){
+  
+  if(index_type == "Mkt.RF"){
+    
+    first_FOMC_date <- as.Date(DT$FOMC[1])
+    end_date <- as.Date("2018-10-29")
+    
+  }else{
+    first_FOMC_date <- as.Date("2007-01-31")
+    end_date <- as.Date("2018-10-29")
+  }
+  
+  
+  index_of_fist_FOMC_date <- which(index(index_data) == first_FOMC_date)
+  begin_date <- index(index_data[index_of_fist_FOMC_date - n_days])
+  
+  return_list <- list(begin_date = begin_date , end_date = end_date)
+  
+  return(return_list)
+  
+}
+get_returns <- function(index_data, begin_end_dates){
+  
+  # Find required dates
+  indices <- which(index(index_data) >= begin_end_dates$begin_date &
+                   index(index_data) <= begin_end_dates$end_date)
+  
+  # Required market excess returns from FF website
+  relevant_index_data <- index_data[indices,]
+  
+  # Sequence of dates with weekends and holidays
+  all_dates <- seq(begin_end_dates$begin_date,
+                   begin_end_dates$end_date,
+                   by = "days")
+  
+  # Exclude weekends (holidays are still included)
+  all_business_days_ind <- which(weekdays(all_dates) %in% c('Monday',
+                                                            'Tuesday',
+                                                            'Wednesday',
+                                                            'Thursday',
+                                                            'Friday'))
+  all_business_days <- all_dates[all_business_days_ind]
+  all_business_days <- data.frame(all_business_days)
+  colnames(all_business_days) <- c("Date")
+  
+  # Default return is zero, will remain 0 during holidays
+  returns <- rep(0,length(all_business_days))
+  
+  index_returns <- as.data.frame(cbind(all_business_days, returns))
+  
+  # Find all non-holidays dates and copy returns
+  indices <- which(index_returns$Date %in% index(relevant_index_data))
+  index_returns$returns[indices] <- as.double(relevant_index_data[,1]) / 100
+  
+  index_returns$Rolling_5d_ret <- rep(0,times = length(all_business_days))
+  index_returns_xts <- xts(index_returns[,-1], order.by=index_returns$Date)
+  index_returns_xts <- na.locf(index_returns_xts, na.rm = FALSE)
+  
+  # Calculate commulative returns for rolling 5 days window
+  index_returns$Rolling_5d_ret <- apply.rolling(R = index_returns_xts$returns,
+                                                 width = 5,
+                                                 trim = TRUE,
+                                                 by = 1,
+                                                 FUN = "Return.cumulative")
+  
+  # We need to shift commulative returns back to make [t;t+4] cummulative return
+  index_returns$Rolling_5d_ret <- lag(index_returns$Rolling_5d_ret, -4)
+  
+  return(index_returns)
+}
+calculate_FOMC_day_means <- function(begin_end_dates, returns){
+  
+  # remove FOMC meetings for analyzing of which we don't have data
+  meetings_dates <- DT$FOMC[DT$FOMC >= begin_end_dates$begin_date &
+                            DT$FOMC<= begin_end_dates$end_date]
+  
+  num_of_meetings <- length(meetings_dates)
+  
+  cycle_returns_df <- as.data.frame(matrix(rep(NA, times = 40), nrow = 1, ncol = 40))
+  
+  # Create a cycle as described in paper
+  for (i in 1:num_of_meetings) {
+   
+    start_FOMC_index <- which(returns$Date == meetings_dates[i]) - 6
+    if (i < num_of_meetings) {
+      end_FOMC_index <- which(returns$Date == meetings_dates[i + 1]) - 1
+    } else {
+      end_FOMC_index <- nrow(returns)
+    }
+    
+    if((end_FOMC_index - start_FOMC_index) > 39){
+      end_FOMC_index <- start_FOMC_index + 39
+    }
+    
+    cycle_returns <- returns[start_FOMC_index:end_FOMC_index, ]
+    
+    # number of days between meeting is not constant
+    number_of_NA <- 40 - length(cycle_returns$Rolling_5d_ret)
+    
+    # Expand with NA
+    cycle_returns_write <- c(as.vector(cycle_returns$Rolling_5d_ret),
+                             rep(x = NA, times = number_of_NA))
+    
+    # Save the sigle cycle returns
+    cycle_returns_df <- rbind(cycle_returns_df, t(cycle_returns_write))
+  }
+  
+  # First row is NAs
+  cycle_returns_df <- cycle_returns_df[-1,]
+  
+  # Find average returns for each day in the cycle
+  means <- colMeans(cycle_returns_df, na.rm = TRUE) * 100
+  
+  return(means)
+}
+plot_FOMC_cycle <- function(means, main){
+ 
+   # plot the graph
+  plot(-6:33,
+       means,
+       type = "l",
+       main = main,
+       xaxt = "n",
+       xlab = "Business days since FOMC meeting", 
+       ylab = "Avg cumulative[t;t+4] MKT.RF (%)" 
+  )
+  
+  axis(1, at = seq(-6, 33, by = 1))
+  points(-6:33, means, col = "black", bg = "black", pch = 18)
+  text(-6:33, means, -6:33, adj = c(-0.3, 1.5), cex = 0.7)
+  abline(h = seq(-0.2, 0.6, 0.1), col = "gray")
+}
+
+test_robustness <- function(MktRF){
+  
+  # add dummy for even weeks separately and jointly
+  num_days <- length(MktRF)
+  
+  # Intruduce dummy variables
+  D0 <- D2 <- D4 <- D6 <- rep(0, num_days)
+  
+  for(i in 1:(nrow(DT) - 2)){
+    k <- match(DT$FOMC[i], index(MktRF))
+    # Week 0
+    D0[(k - 1):(k + 3)] <- rep(1, 5)
+    # Week 2
+    D2[(k + 9):(k + 13)] <- rep(1, 5)
+    # Week 4
+    D4[(k + 19):(k + 23)] <- rep(1, 5)
+    # Week 6
+    D6[(k + 29):(k + 33)] <- rep(1, 5)
+  }
+  
+  #dummy for all even weeks
+  D6 <- D6[1:length(D0)]
+  D <- D0 + D2 + D4 + D6 
+  
+  #dummy for weeks 2,4,6 
+  D246 <- D - D0 
+  
+  reg1a <- lm(MktRF ~ D)
+  reg1b <- lm(MktRF ~ D0 + D246)
+  reg1c <- lm(MktRF ~ D0 + D2 + D4 + D6)
+  
+  print(summary(reg1a))
+  print(summary(reg1b))
+  print(summary(reg1c))
+}
+
+
+data_list <- data_load()
+
+# Market excess returns
+begin_end_dates_MktRF <- determine_dates(data_list$MktRF,
+                                         n_days = 6,
+                                         index_type = "Mkt.RF")
+
+Sys.setlocale(category = "LC_ALL", locale = "english")
+returns <- get_returns(data_list$MktRF, begin_end_dates_MktRF)
+means <- calculate_FOMC_day_means(begin_end_dates_MktRF, returns)
+@
+
+\section*{Presentations:}
+\begin{itemize}
+\item \text{Ilia can present}
+\item \text{Aliaksandr can present}
+\end{itemize}
+
+\section*{Introduction, data description}
+Since graph in paper was constructed on Fama-French factor file on Ken French website, we use the same data. Since daily market excess returns at this website are sofar avaiable until 31.10.2018, and the last full week in FOMC cycle for this data ends at 29.10.2018, we restrict our analysis up to 29.10.2018, taking FOMC meeting at 26.09.2018 as the last one
+
+\section*{Market excess returns. Figure 1}
+<<echo=TRUE, fig=TRUE>>=
+plot_FOMC_cycle(means, main="MKT.RF over FOMC Cycle, 01.1994 - 10.2018")
+@
+
+<<echo=FALSE >>=
+cat("% of negative returns in odd weeks")
+1 - sum(c(means[1:5] > 0, means[11:15] > 0, means[21:25] > 0), means[31:35] > 0)/20
+cat("% of positive returns in even weeks")
+sum(c(means[6:10] > 0, means[16:20] > 0, means[26:30] > 0), means[36:40] > 0)/20
+@
+
+From this figure we can see the core empirical result of the paper: the behavior of US MKT.RF over the FOMC cycle from 01.1994 through 10.2018. Date 0 on the x-axis is the day of a scheduled FOMC meeting. Weekends are omitted and returns are set to zero on holidays. Thus, 10 days on the horizontal axis represent 2 calendar weeks after an FOMC meeting, and so on [Cieslak, Morse, Vissing-Jorgensen (2018)]. On the  y-axis, we graph the 5-day MKT.RF (using Fama-French data) from (and including) day t to day t+4. The y-axis is in percent. The figure shows a surprising results: 5-day stock market excess returns are high in even weeks in FOMC cycle time.
+To be more specific, average returns in even weeks (weeks 0 (days -1 to 3), 2 (days 9 to 13), 4 (days 19 to 23), 6 (days 29 to 33)) are mostly positive (85 percent), while those in odd weeks (weeks -1(days -6 to -2), 1 (days 4 to 8), 3 (days 14 to 18), 5 (days 24 to 28)) are lower and sometines negative (30 percent).
+
+\section*{Rassel 2000. Figure 2}
+<<echo=FALSE>>=
+begin_end_dates_rassel <- determine_dates(data_list$rassel,
+                                         n_days = 6,
+                                         index_type = "rassel")
+
+returns <- get_returns(data_list$rassel, begin_end_dates_rassel)
+means <- calculate_FOMC_day_means(begin_end_dates_rassel, returns)
+@
+
+<<echo=TRUE, fig=TRUE>>=
+plot_FOMC_cycle(means, main="Rassel 2000 over FOMC Cycle, 01.1994 - 10.2018")
+@
+
+<<echo=FALSE >>=
+cat("% of negative returns in odd weeks")
+1 - sum(c(means[1:5] > 0, means[11:15] > 0, means[21:25] > 0), means[31:35] > 0)/20
+cat("% of positive returns in even weeks")
+sum(c(means[6:10] > 0, means[16:20] > 0, means[26:30] > 0), means[36:40] > 0)/20
+@
+The Russell 2000 Index is a small-cap stock market index of the bottom 2,000 stocks in the Russell 3000 Index that seeks to be a benchmark of the entire U.S stock market. It measures the performance of the 3,000 largest publicly held companies incorporated in America as measured by total market capitalization, and represents approximately 98 percent of the American public equity market.
+The construction of the figure is the same as previosly mentrioned but results are a bit different as well as magnitude of the range of average cumulative returns which is smaller than for MKT.RF.
+Average returns in even weeks: in week 0(-1 to 3), the values are positive but at day 3 the value is negative; in week 2(9 to 13) the values are mostly positive (at day 12 and 13 they are negative); in week 4(19 to 23) they are positive and in week 6 (29 to 33) they are strictly positive, while those in odd weeks: in week -1(-6 to -2) most of them are negative (only at day -4 and -2 they are positive); in week 1(4 to 8), they are mostly positive (only at day 4 and 5 they are negative); in week 3 (14 to 18) they are mostly positive (only at day 14 the value is negative); in week 5(24 to 28) they are mostly positive (only at 25 and 27 they are negative). Thus overall, if we compare both graphs visually and also consider the percentage of negatives returns in odd weeks (40) and percentage of positive returns in even weeks (0.85), we can say that the pattern persist.
+
+\section*{Commodities. Figure 3}
+<<echo=FALSE >>=
+begin_end_dates_cmdt <- determine_dates(data_list$cmdt,
+                                        n_days = 6,
+                                        index_type = "cmdt")
+
+returns <- get_returns(data_list$cmdt , begin_end_dates_cmdt)
+means <- calculate_FOMC_day_means(begin_end_dates_cmdt, returns)
+@
+
+<<echo=TRUE, fig=TRUE>>=
+plot_FOMC_cycle(means, main="Commodities over FOMC Cycle, 01.1994 - 10.2018")
+@
+
+<<echo=FALSE >>=
+cat("% of negative returns in odd weeks")
+1 - sum(c(means[1:5] > 0, means[11:15] > 0, means[21:25] > 0), means[31:35] > 0)/20
+cat("% of positive returns in even weeks")
+sum(c(means[6:10] > 0, means[16:20] > 0, means[26:30] > 0), means[36:40] > 0)/20
+@
+Average returns in even weeks: in week 0(-1 to 3), the value is mostly negative but at day 0 and 2 the value is positive; in week 2(9 to 13) the values are stricly positive; in week 4(19 to 23) they are strictly negative as well as in week 6 (29 to 33), while those in odd weeks: in week -1(-6 to -2) they are negative; in week 1(4 to 8), they are mostly negative (only at day 8 they are negative); in week 3 (14 to 18) they are mostly negative (only at day 14 and 17 the value is positive); in week 5(24 to 28) they are negative. Such results mean that Commodities are less influenced by FOMC cycle. Moreover visual comparison of graphs also says so.
+
+\section*{EURUSD. Figure 4}
+<<echo=FALSE >>=
+begin_end_dates_EURUSD <- determine_dates(data_list$EURUSD,
+                                          n_days = 6,
+                                          index_type = "currency")
+
+returns <- get_returns(data_list$EURUSD, begin_end_dates_EURUSD)
+means <- calculate_FOMC_day_means(begin_end_dates_EURUSD, returns)
+@
+
+<<echo=TRUE, fig=TRUE>>=
+plot_FOMC_cycle(means, main="EURUSD over FOMC Cycle, 01.1994 - 10.2018")
+@
+
+<<echo=FALSE >>=
+cat("% of negative returns in odd weeks")
+1 - sum(c(means[1:5] > 0, means[11:15] > 0, means[21:25] > 0), means[31:35] > 0)/20
+cat("% of positive returns in even weeks")
+sum(c(means[6:10] > 0, means[16:20] > 0, means[26:30] > 0), means[36:40] > 0)/20
+@
+Average returns in even weeks: in week 0(-1 to 3), the value is mostly negative but at day 0 the value is positive; in week 2(9 to 13) the values are mostly positive (at day 10 and 13 - negative); in week 4(19 to 23) they are mostly positive (at 21 and 22 - negative); in week 6 (29 to 33) the values are stricly positive, while those in odd weeks: in week -1(-6 to -2) they are mostly negative (at -6 and -5 - positive); in week 1(4 to 8), they are negative; in week 3 (14 to 18) they are mostly positive (only at day 18 the value is negative); in week 5(24 to 28) they are mostly positive (at 25 - negative). Such results again mean that EURUSD are less influenced by FOMC cycle. Moreover visual comparison of graphs also says so.
+
+\section*{Robustness}
+According to the authors the FOMC calendar is quite irregular and changes across subperiods over which their finding is robust. Since 1981, the FOMC meets at scheduled times, which is announced ahead of time - 8 times per year; the time between meetings varies across meetings and years; schedule does not line up with any kind of bi-weekly timing in regular calendar time. Thus the results of the paper are robust to including regular calendar fixed effects: week of the year, day of month, day of week, month of year [Cieslak, Morse, Vissing-Jorgensen (2018)].
+
+<<echo=TRUE >>=
+test_robustness(data_list$MktRF)
+@
+
+Each regression show significant coefficients with 10 percent sinificance level, except the last regression where D6 appeared to be insignificant. The average Mkt.RF is approximately 0,055 higher (Mkt.RF is in percent) on even-week days than odd week days. Thus, the model is robust.
+
+\section*{Conclusion}
+
+From the provided data, we can conclude that bi-weekly pattern over the FOMC Cycle in Market excess returns as well as in Rassel 2000 is present and observable. However, in Commodities and EURUSD it is not the case and such pattern is not traceable, meaning that we can exclude the exchange rate and commodities as a possible cause for the stock return pattern in the FOMC Cycle. Most likely market inefficiencies is the result of the changing in average return according to the weeks. If the market was efficient, then traders would react to the information of the FOMC as it occured.The decisions of FED on FOMC dates have a big effect on US returns due to the effect that Fed rates will have on real returns. But it supposed to have a smooth effects on the market.  The literature identifies that there seems to be excess returns earned in the stock returns following even weeks after the FOMC cycle. That pattern is proved by our results as well as from the results of the paper. 
+Overall, high even-week stock returns 1) Could represent a risk premium for news about monetary policy or the
+economy coming from the Fed in even weeks or 2) Could result from monetary policy being on average unexpectedly accommodating over 1994-2018 period, with the market-moving news from the Fed coming out in even weeks. If 2 is true, then the stock market should mean-revert following low stock market returns, and this mean-reversion should only be observed in even weeks OR following low stock market returns, the Fed should lower
+the federal funds target rate [Cieslak, Morse, Vissing-Jorgensen (2018)].
+
+Another explanations of such pattern may be the following:
+\newline 
+1.Leaks to the press involving information about views expressed at the meetings, and confidential materials.
+\newline
+2.Inappropriate access to information by “well-connected” outsiders other than the media, including consultants and market participants.
+\newline
+3.FOMC participants tendency to take strong, inflexible policy positions before the meetings at which decisions are to be made.
+
+
+
+
+\end{document}
